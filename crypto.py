@@ -1,28 +1,28 @@
-from datetime import datetime, timedelta, date
-from itertools import cycle
 import os
 import sys
 import traceback
-
-from PyQt5.QtGui import *
-from PyQt5.QtWidgets import *
-from PyQt5.QtCore import *
+from itertools import cycle
 
 import numpy as np
-
 import pyqtgraph as pg
 import requests
 import requests_cache
+from PyQt5.QtCore import *
+from PyQt5.QtGui import *
+from PyQt5.QtWidgets import *
+
+APPLICATION_NAME = 'QCoinGraph'
 
 # CryptoCompare.com API Key
 CRYPTOCOMPARE_API_KEY = ''
 
 # Define a requests http cache to minimise API requests.
-requests_cache.install_cache(os.path.expanduser('~/.goodforbitcoin'))
+requests_cache.install_cache(os.path.expanduser('./.cache_requests'))
 
 # Base currency is used to retrieve rates from bitcoinaverage.
 DEFAULT_BASE_CURRENCY = 'USD'
-AVAILABLE_BASE_CURRENCIES = ['USD', 'EUR', 'GBP']
+AVAILABLE_BASE_CURRENCIES = ['USD', 'EUR', 'GBP', 'BRL']
+
 
 # The crypto currencies to retrieve data about.
 AVAILABLE_CRYPTO_CURRENCIES = ['BTC', 'ETH', 'LTC', 'EOS', 'XRP', 'BCH']
@@ -38,6 +38,40 @@ BREWER12PAIRED = cycle(['#a6cee3', '#1f78b4', '#b2df8a', '#33a02c', '#fb9a99', '
 # Base PyQtGraph configuration.
 pg.setConfigOption('background', 'w')
 pg.setConfigOption('foreground', 'k')
+
+
+def fetch_rates(crypto: str, currency: str):
+    url = 'https://min-api.cryptocompare.com/data/histoday?fsym={fsym}&tsym={tsym}&limit={limit}'
+
+    r = requests.get(
+        url.format(**{
+            'fsym': crypto,
+            'tsym': currency,
+            'limit': NUMBER_OF_TIMEPOINTS - 1,
+            'format': 'json',
+        })
+    )
+    r.raise_for_status()
+
+    return r.json()
+
+
+def fetch_volumes(currency: str):
+    url = 'https://min-api.cryptocompare.com/data/exchange/histoday?tsym={tsym}&limit={limit}'
+    auth_header = {'Apikey': CRYPTOCOMPARE_API_KEY}
+
+    r = requests.get(
+        url.format(**{
+            'tsym': currency,
+            'limit': NUMBER_OF_TIMEPOINTS - 1,
+            'format': 'json',
+        }),
+        headers=auth_header
+    )
+
+    r.raise_for_status()
+
+    return r.json()
 
 
 class WorkerSignals(QObject):
@@ -65,44 +99,22 @@ class UpdateWorker(QRunnable):
 
     @pyqtSlot()
     def run(self):
-        auth_header = {
-            'Apikey': CRYPTOCOMPARE_API_KEY
-        }
-
         try:
             rates = {}
-            for n, crypto in enumerate(AVAILABLE_CRYPTO_CURRENCIES, 1):
-                url = 'https://min-api.cryptocompare.com/data/histoday?fsym={fsym}&tsym={tsym}&limit={limit}'
-                r = requests.get(
-                    url.format(**{
-                        'fsym': crypto,
-                        'tsym': self.base_currency,
-                        'limit': NUMBER_OF_TIMEPOINTS-1,
-                        'format': 'json',
-                    }),
-                    headers=auth_header,
-                )
-                r.raise_for_status()
-                rates[crypto] = r.json().get('Data')
 
-                self.signals.progress.emit(
-                    int(100 * n / len(AVAILABLE_CRYPTO_CURRENCIES)))
+            for n, crypto in enumerate(AVAILABLE_CRYPTO_CURRENCIES, 1):
+
+                rates_res = fetch_rates(crypto, self.base_currency)
+                rates[crypto] = rates_res['Data']
+
+                self.signals.progress.emit(int(100 * n / len(AVAILABLE_CRYPTO_CURRENCIES)))
 
                 if self.is_interrupted:
                     # Stop without emitting finish signals.
                     return
 
-            url = 'https://min-api.cryptocompare.com/data/exchange/histoday?tsym={tsym}&limit={limit}'
-            r = requests.get(
-                url.format(**{
-                    'tsym': self.base_currency,
-                    'limit': NUMBER_OF_TIMEPOINTS-1,
-                    'format': 'json',
-                }),
-                headers=auth_header,
-            )
-            r.raise_for_status()
-            volume = [d['volume'] for d in r.json().get('Data')]
+            volume_res = fetch_volumes(self.base_currency)
+            volume = [d['volume'] for d in volume_res['Data']]
 
         except Exception as e:
             self.signals.error.emit((e, traceback.format_exc()))
@@ -115,10 +127,27 @@ class UpdateWorker(QRunnable):
         self.is_interrupted = True
 
 
+def notify_error(error):
+    e, tb = error
+    msg = QMessageBox()
+    msg.setIcon(QMessageBox.Warning)
+    msg.setText(e.__class__.__name__)
+    msg.setInformativeText(str(e))
+    msg.setDetailedText(tb)
+    msg.exec_()
+
+
 class MainWindow(QMainWindow):
 
     def __init__(self, *args, **kwargs):
         super(MainWindow, self).__init__(*args, **kwargs)
+
+        # Init Data Graphs
+        self.data = {}
+        self.volume = []
+
+        self.setWindowTitle(APPLICATION_NAME)
+        self.setAttribute(Qt.WA_DeleteOnClose)
 
         layout = QHBoxLayout()
 
@@ -184,28 +213,34 @@ class MainWindow(QMainWindow):
         self.listView.setFixedSize(226, 400)
         self.setFixedSize(650, 400)
 
-        toolbar = QToolBar("Main")
-        self.addToolBar(toolbar)
-        self.currencyList = QComboBox()
+        self.toolbar = QToolBar("Main")
+        self.toolbar.setMovable(False)
+        self.addToolBar(self.toolbar)
 
-        toolbar.addWidget(self.currencyList)
-        self.update_currency_list(AVAILABLE_BASE_CURRENCIES)
+        # QCombox Currency
+        self.currencyList = QComboBox()
+        self.currencyList.addItems([x for x in AVAILABLE_BASE_CURRENCIES])
+        self.currencyList.model().sort(0)
         self.currencyList.setCurrentText(self.base_currency)
         self.currencyList.currentTextChanged.connect(self.change_base_currency)
 
+        # ProgressBar Status Download data
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
-        toolbar.addWidget(self.progress)
 
+        # Button Cancell Download
+        self.btnCancel = QPushButton("Cancel", self)
+        self.btnCancel.setToolTip("Cancel Download")
+        self.btnCancel.clicked.connect(self.on_cancel_work)
+        self.btnCancel.setDisabled(True)
+
+        # Add items to Toolbar
+        self.toolbar.addWidget(self.progress)
+        self.toolbar.addWidget(self.btnCancel)
+        self.toolbar.addWidget(self.currencyList)
+
+        # Show data Graph
         self.refresh_historic_rates()
-        self.setWindowTitle("Goodforbitcoin")
-        self.show()
-
-    def update_currency_list(self, currencies):
-        for currency in currencies:
-            self.currencyList.addItem(currency)
-
-        self.currencyList.model().sort(0)
 
     def check_check_state(self, i):
         if not i.isCheckable():  # Skip data columns.
@@ -280,39 +315,42 @@ class MainWindow(QMainWindow):
             # If we have a current worker, send a kill signal
             self.worker.signals.cancel.emit()
 
-        # Prefill our data store with None ('no data')
+        # Clear data
         self.data = {}
         self.volume = []
+
+        self.btnCancel.setDisabled(False)
 
         self.worker = UpdateWorker(self.base_currency)
         # Handle callbacks with data and trigger refresh.
         self.worker.signals.data.connect(self.result_data_callback)
         self.worker.signals.finished.connect(self.refresh_finished)
         self.worker.signals.progress.connect(self.progress_callback)
-        self.worker.signals.error.connect(self.notify_error)
+        self.worker.signals.error.connect(notify_error)
+
         self.threadpool.start(self.worker)
+
+    @pyqtSlot()
+    def on_cancel_work(self):
+        if self.worker:
+            self.worker.signals.cancel.emit()
 
     def result_data_callback(self, rates, volume):
         self.data = rates
         self.volume = volume
+
         self.redraw()
-        self.update_data_viewer(NUMBER_OF_TIMEPOINTS-1)
+
+        self.update_data_viewer(NUMBER_OF_TIMEPOINTS - 1)
 
     def progress_callback(self, progress):
         self.progress.setValue(progress)
 
     def refresh_finished(self):
+        self.btnCancel.setDisabled(True)
+
         self.worker = False
         self.redraw()
-
-    def notify_error(self, error):
-        e, tb = error
-        msg = QMessageBox()
-        msg.setIcon(QMessageBox.Warning)
-        msg.setText(e.__class__.__name__)
-        msg.setInformativeText(str(e))
-        msg.setDetailedText(tb)
-        msg.exec_()
 
     def update_plot_scale(self):
         self.p2.setGeometry(self.p1.vb.sceneBoundingRect())
@@ -365,15 +403,23 @@ class MainWindow(QMainWindow):
                         self._data_lines[currency]['low'].clear()
                         self._data_lines[currency]['close'].clear()
 
-        self.ax.setLimits(yMin=y_min * 0.9, yMax=y_max *
-                          1.1, xMin=min(x), xMax=max(x))
+        self.ax.setLimits(yMin=y_min * 0.9, yMax=y_max * 1.1, xMin=min(x), xMax=max(x))
 
         self._market_activity.setData(x, self.volume)
         self.p2.setYRange(0, max(self.volume))
 
 
-if __name__ == '__main__':
+class InitApplicationQT(QApplication):
+    def __init__(self):
+        super().__init__([])
 
-    app = QApplication([])
-    window = MainWindow()
-    app.exec_()
+        self.setApplicationName(APPLICATION_NAME)
+
+        window = MainWindow()
+        window.show()
+
+        sys.exit(self.exec_())
+
+
+if __name__ == '__main__':
+    InitApplicationQT()
