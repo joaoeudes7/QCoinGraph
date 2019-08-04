@@ -12,6 +12,7 @@ from PyQt5.QtGui import *
 from PyQt5.QtWidgets import *
 
 APPLICATION_NAME = 'QCoinGraph'
+APPLICATION_ICON = os.path.expanduser('./resources/icon.ico')
 
 # CryptoCompare.com API Key
 CRYPTOCOMPARE_API_KEY = ''
@@ -147,6 +148,7 @@ class MainWindow(QMainWindow):
         self.volume = []
 
         self.setWindowTitle(APPLICATION_NAME)
+        self.setWindowIcon(QIcon(APPLICATION_ICON))
         self.setAttribute(Qt.WA_DeleteOnClose)
 
         layout = QHBoxLayout()
